@@ -63,6 +63,15 @@ interface IADUserId {
   }
 }
 
+// adaptAD: minimal typings for the Web Speech API events we use
+interface SpeechRecognitionEvent extends Event {
+  readonly results: SpeechRecognitionResultList
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  readonly error: string
+}
+
 interface ApiError {
   response?: {
     status: number
@@ -1550,6 +1559,139 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
 
     return <></>
   }
+
+  // ---------------------------------------------------------------------------
+  // adaptAD: keyboard-driven, voice-first helper.
+  //   Alt+D  -> describe the current moment of the video
+  //   Alt+Q  -> ask a spoken question about the current moment
+  // Both go through POST /api/users/adapt-ad on the backend, which relays to
+  // the AI service, and the answer is read aloud with speechSynthesis.
+  // ---------------------------------------------------------------------------
+  const adaptADUrl = `${process.env.REACT_APP_YDX_BACKEND_URL}/api/users/adapt-ad`
+  const dingSoundRef = useRef<Howl | null>(null)
+  const getDingSound = (): Howl => {
+    if (!dingSoundRef.current) {
+      dingSoundRef.current = new Howl({ src: ['/ding-new.mp3'] })
+    }
+    return dingSoundRef.current
+  }
+
+  const postAdaptAD = async (question?: string): Promise<string> => {
+    const response = await axios.post(
+      adaptADUrl,
+      {
+        youtubeVideoId: videoId,
+        question,
+        timeStamp: currentEventRef.current?.getCurrentTime() ?? 0,
+      },
+      {
+        withCredentials: true,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    )
+    return typeof response.data === 'string'
+      ? response.data
+      : JSON.stringify(response.data)
+  }
+
+  const fetchAdaptADDescription = async (): Promise<string> => {
+    try {
+      return await postAdaptAD()
+    } catch (error) {
+      console.error('adaptAD: error fetching description:', error)
+      toast.error('Something went wrong, please try again later')
+      return 'Sorry, I could not get a description right now.'
+    }
+  }
+
+  const fetchAdaptADAnswer = async (question: string): Promise<string> => {
+    // Normalize the question: lowercase, strip punctuation
+    const normalizedQuestion = question
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+    try {
+      return await postAdaptAD(normalizedQuestion)
+    } catch (error) {
+      console.error('adaptAD: error fetching answer:', error)
+      toast.error('Something went wrong, please try again later')
+      return 'Sorry, I could not get an answer right now.'
+    }
+  }
+
+  const captureSpeech = (): Promise<string> => {
+    getDingSound().play()
+    return new Promise((resolve, reject) => {
+      const SpeechRecognitionCtor =
+        window.SpeechRecognition || window.webkitSpeechRecognition
+      if (!SpeechRecognitionCtor) {
+        reject(new Error('Speech recognition not supported in this browser.'))
+        return
+      }
+
+      const recognition = new SpeechRecognitionCtor()
+      recognition.lang = 'en-US'
+      recognition.interimResults = false
+      recognition.maxAlternatives = 1
+
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        resolve(event.results[0][0].transcript)
+      }
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        console.error('adaptAD: speech recognition error:', event.error)
+        reject(new Error('Could not recognize speech.'))
+      }
+
+      recognition.start()
+    })
+  }
+
+  const readTextAloud = (text: string) => {
+    const voices = window.speechSynthesis.getVoices()
+    const desiredVoice = voices.find(
+      (voice) => voice.name === 'Google US English',
+    )
+    const utterance = new SpeechSynthesisUtterance(text)
+    if (desiredVoice) {
+      utterance.voice = desiredVoice
+    } else {
+      utterance.lang = 'en-US'
+    }
+    window.speechSynthesis.speak(utterance)
+    currentEventRef.current?.pauseVideo()
+  }
+
+  useEffect(() => {
+    const handleAdaptADKeyDown = async (e: KeyboardEvent) => {
+      if (!e.altKey) return
+
+      if (e.code === 'KeyD') {
+        e.preventDefault()
+        currentEventRef.current?.pauseVideo()
+        readTextAloud('Getting the description')
+        getDingSound().play()
+        const description = await fetchAdaptADDescription()
+        readTextAloud(description)
+      } else if (e.code === 'KeyQ') {
+        e.preventDefault()
+        currentEventRef.current?.pauseVideo()
+        try {
+          const question = await captureSpeech()
+          readTextAloud(question) // echo the question back to the user
+          const answer = await fetchAdaptADAnswer(question)
+          readTextAloud(answer)
+        } catch (error) {
+          console.error('adaptAD: error during speech capture or fetch:', error)
+          readTextAloud('Sorry, something went wrong.')
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleAdaptADKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleAdaptADKeyDown)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId])
 
   if (isBlockedTutorialVideo) {
     return null
