@@ -1569,6 +1569,7 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
   // ---------------------------------------------------------------------------
   const adaptADUrl = `${process.env.REACT_APP_YDX_BACKEND_URL}/api/users/adapt-ad`
   const dingSoundRef = useRef<Howl | null>(null)
+  const adaptADInFlightRef = useRef(false)
   const getDingSound = (): Howl => {
     if (!dingSoundRef.current) {
       dingSoundRef.current = new Howl({ src: ['/ding-new.mp3'] })
@@ -1587,6 +1588,7 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
       {
         withCredentials: true,
         headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
       },
     )
     return typeof response.data === 'string'
@@ -1605,10 +1607,8 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
   }
 
   const fetchAdaptADAnswer = async (question: string): Promise<string> => {
-    // Normalize the question: lowercase, strip punctuation
-    const normalizedQuestion = question
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, '')
+    // Preserve the user's original language and punctuation.
+    const normalizedQuestion = question.trim()
     try {
       return await postAdaptAD(normalizedQuestion)
     } catch (error) {
@@ -1619,15 +1619,17 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
   }
 
   const captureSpeech = (): Promise<string> => {
-    getDingSound().play()
     return new Promise((resolve, reject) => {
       const SpeechRecognitionCtor =
         window.SpeechRecognition || window.webkitSpeechRecognition
       if (!SpeechRecognitionCtor) {
-        reject(new Error('Speech recognition not supported in this browser.'))
+        reject(
+          new Error('Voice questions are not supported in this browser.'),
+        )
         return
       }
 
+      getDingSound().play()
       const recognition = new SpeechRecognitionCtor()
       recognition.lang = 'en-US'
       recognition.interimResults = false
@@ -1662,27 +1664,66 @@ const Video = ({ isTutorialMode = false }: VideoProps) => {
 
   useEffect(() => {
     const handleAdaptADKeyDown = async (e: KeyboardEvent) => {
-      if (!e.altKey) return
+      if (
+        !e.altKey ||
+        e.repeat ||
+        (e.code !== 'KeyD' && e.code !== 'KeyQ')
+      ) {
+        return
+      }
 
-      if (e.code === 'KeyD') {
-        e.preventDefault()
+      const target = e.target
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          target.closest(
+            'input, textarea, [contenteditable="true"], [role="textbox"]',
+          ))
+      ) {
+        return
+      }
+
+      e.preventDefault()
+      if (adaptADInFlightRef.current) {
+        toast.info('AdaptAD is still processing your previous request.')
+        return
+      }
+      adaptADInFlightRef.current = true
+      window.speechSynthesis.cancel()
+
+      try {
         currentEventRef.current?.pauseVideo()
-        readTextAloud('Getting the description')
-        getDingSound().play()
-        const description = await fetchAdaptADDescription()
-        readTextAloud(description)
-      } else if (e.code === 'KeyQ') {
-        e.preventDefault()
-        currentEventRef.current?.pauseVideo()
-        try {
+        if (e.code === 'KeyD') {
+          readTextAloud('Getting the description')
+          getDingSound().play()
+          const description = await fetchAdaptADDescription()
+          readTextAloud(description)
+        } else {
+          const SpeechRecognitionCtor =
+            window.SpeechRecognition || window.webkitSpeechRecognition
+          if (!SpeechRecognitionCtor) {
+            const message = 'Voice questions are not supported in this browser.'
+            toast.error(message)
+            readTextAloud(message)
+            return
+          }
+
           const question = await captureSpeech()
           readTextAloud(question) // echo the question back to the user
           const answer = await fetchAdaptADAnswer(question)
           readTextAloud(answer)
-        } catch (error) {
-          console.error('adaptAD: error during speech capture or fetch:', error)
-          readTextAloud('Sorry, something went wrong.')
         }
+      } catch (error) {
+        console.error('adaptAD: error during speech capture or fetch:', error)
+        const message =
+          error instanceof Error &&
+          error.message === 'Voice questions are not supported in this browser.'
+            ? error.message
+            : 'Sorry, something went wrong.'
+        toast.error(message)
+        readTextAloud(message)
+      } finally {
+        adaptADInFlightRef.current = false
       }
     }
 
